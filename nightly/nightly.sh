@@ -135,7 +135,7 @@ EOF
 )
     printf '%s\n' "$cmd" > "$dest_dir/cmd"
     ssh "${SSH_OPTS[@]}" "$(remote_dest)" "bash -lc $(printf '%q' "$cmd")" \
-        > "$dest_dir/stdout.log" 2> "$dest_dir/stderr.log"
+        > >(tee "$dest_dir/stdout.log") 2> >(tee "$dest_dir/stderr.log" >&2)
 }
 
 sync_self() {
