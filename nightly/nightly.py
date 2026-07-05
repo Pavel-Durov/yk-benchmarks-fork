@@ -122,12 +122,13 @@ def ssh_run(dest: str, remote_cmd: str, stdout: Path | None = None,
 def clone_one(target: dict, ws: Path) -> None:
     name, repo, ref = target["name"], target["repo"], target.get("ref", "main")
     if (ws / ".git").is_dir():
-        log(f"update {name} @ {ref} (fetching)")
-        subprocess.check_call(["git", "-C", str(ws), "fetch", "--all", "--tags", "--prune"])
-        log(f"update {name} (checkout + pull)")
-        subprocess.check_call(["git", "-C", str(ws), "checkout", ref])
-        subprocess.call(["git", "-C", str(ws), "pull", "--ff-only", "origin", ref],
-                        stderr=subprocess.DEVNULL)
+        # Shallow clones only fetch the branch they were cloned with; fetch this
+        # specific ref by name so a config ref-change (or a fresh branch) works.
+        log(f"update {name} @ {ref} (fetching ref)")
+        subprocess.check_call(["git", "-C", str(ws), "fetch", "--depth", "1",
+                               "--tags", "origin", ref])
+        log(f"update {name} (reset to origin/{ref})")
+        subprocess.check_call(["git", "-C", str(ws), "checkout", "-B", ref, "FETCH_HEAD"])
     else:
         log(f"clone {name} @ {ref} (fresh, shallow)")
         subprocess.check_call(["git", "clone", "--depth", "1", "--branch", ref,
@@ -214,14 +215,18 @@ def cmd_sync(cfg: dict) -> int:
             log(f"clone FAILED for target {t['name']}: {e}")
             return 1
 
-    log(f"phase 2/2: push repo + {n} targets to remote (parallel)")
-    tasks = [("__self__", lambda: sync_self(dest_host, root))]
-    for t in targets:
-        ws = HERE / "workspace" / t["name"]
-        tasks.append((t["name"], lambda t=t, ws=ws: push_one(t, ws, dest_host, root)))
-    errs = _parallel(lambda pair: pair[1](), tasks)
+    log("phase 2/3: push yk-benchmarks-fork to remote (must land before target pushes)")
     rc = 0
-    for (name, _), e in zip(tasks, errs):
+    try:
+        sync_self(dest_host, root)
+    except Exception as e:  # noqa: BLE001
+        log(f"push FAILED for yk-benchmarks-fork: {e}")
+        return 1
+
+    log(f"phase 3/3: push {n} targets to remote (parallel)")
+    tasks = [(t["name"], t, HERE / "workspace" / t["name"]) for t in targets]
+    errs = _parallel(lambda x: push_one(x[1], x[2], dest_host, root), tasks)
+    for (name, _, _), e in zip(tasks, errs):
         if e:
             log(f"push FAILED for {name}: {e}"); rc = 1
     log(f"sync: done (rc={rc})")
@@ -248,6 +253,56 @@ def cmd_build(cfg: dict) -> int:
     return rc
 
 
+def _ssh_check_output(dest: str, cmd: str) -> tuple[int, str]:
+    r = subprocess.run(["ssh", *SSH_OPTS, dest, cmd], capture_output=True, text=True)
+    return r.returncode, (r.stdout.strip() or r.stderr.strip())
+
+
+def cmd_check(cfg: dict) -> int:
+    """Verify each target on the remote: repo at $remote_root/<name> is on the
+    expected ref AND target.env.EXE exists and is executable."""
+    remote, targets = cfg["remote"], cfg["targets"]
+    dest_host, root = remote_dest(remote), remote["root"]
+    log(f"check: {len(targets)} targets against remote {dest_host}:{root}")
+    rc = 0
+    for t in targets:
+        name = t["name"]; want = t.get("ref", "main")
+        repo_dir = f"{root}/{name}"
+        # Ref: try branch name; fall back to short SHA if detached.
+        q = shlex.quote(repo_dir)
+        cmd = (f"if [ -d {q}/.git ]; then "
+               f"b=$(git -C {q} rev-parse --abbrev-ref HEAD); "
+               f"if [ \"$b\" = HEAD ]; then git -C {q} rev-parse --short HEAD; "
+               f"else echo \"$b\"; fi; "
+               f"else echo NOT_CLONED; exit 2; fi")
+        log(f"[{name}] repo: ssh {dest_host} 'git -C {repo_dir} HEAD' (want ref={want})")
+        code, got = _ssh_check_output(dest_host, cmd)
+        ref_ok = code == 0 and got == want
+        ref_msg = got or "?"
+        if not ref_ok:
+            ref_msg += f" (expected {want})"
+        log(f"[{name}] repo: {'OK' if ref_ok else 'FAIL'} — got {ref_msg}")
+
+        exe = (t.get("env") or {}).get("EXE")
+        if exe:
+            log(f"[{name}] build: ssh {dest_host} test -x {exe}")
+            r = subprocess.run(["ssh", *SSH_OPTS, dest_host,
+                                f"test -x {shlex.quote(exe)}"], capture_output=True)
+            exe_ok = r.returncode == 0
+            exe_msg = "OK" if exe_ok else f"MISSING {exe}"
+        else:
+            exe_ok = True
+            exe_msg = "(no env.EXE — skipped)"
+        log(f"[{name}] build: {'OK' if exe_ok else 'FAIL'} — {exe_msg}")
+
+        mark = "✓" if ref_ok and exe_ok else "✗"
+        print(f"{mark} {name:<43} {ref_msg:<40} {exe_msg}")
+        if not (ref_ok and exe_ok):
+            rc = 1
+    log(f"check: done (rc={rc})")
+    return rc
+
+
 def cmd_bench(cfg: dict) -> int:
     remote = cfg["remote"]; targets = cfg["targets"]
     results_dir = _timestamped("")
@@ -268,7 +323,7 @@ def cmd_bench(cfg: dict) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(prog="nightly.py")
-    p.add_argument("command", choices=["sync", "build", "bench", "run"])
+    p.add_argument("command", choices=["sync", "build", "bench", "run", "check"])
     p.add_argument("--config", default=str(HERE / "config.toml"))
     args = p.parse_args(argv)
 
@@ -290,6 +345,7 @@ def main(argv: list[str] | None = None) -> int:
         case "build": return cmd_build(cfg)
         case "bench": return cmd_bench(cfg)
         case "run":   return cmd_build(cfg) or cmd_bench(cfg)
+        case "check": return cmd_check(cfg)
     return 0
 
 
