@@ -2,12 +2,12 @@
 # Config-driven runner for haste benchmarks on a remote bench host.
 # Subcommands: sync | run
 # Usage: nightly.sh <sync|run> [--config path]
-# ponytail: single-file bash + jq; split into lib.sh only if it grows past ~200 lines.
+# ponytail: single-file bash + jq (TOML→JSON via python3 tomllib at startup); split into lib.sh if past ~200 lines.
 
 set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-CONFIG="$HERE/config.json"
+CONFIG="$HERE/config.toml"
 
 # Reuse one SSH connection across all ssh/rsync calls in this run.
 SSH_CTL="/tmp/nightly-ssh-%C"
@@ -18,7 +18,7 @@ die()  { printf 'nightly: %s\n' "$*" >&2; exit 1; }
 
 parse_args() {
     CMD="${1:-}"
-    [ -n "$CMD" ] || die "usage: nightly.sh <sync|build|bench> [--config path]"
+    [ -n "$CMD" ] || die "usage: nightly.sh <sync|build|bench|run> [--config path]"
     shift
     while [ $# -gt 0 ]; do
         case "$1" in
@@ -31,6 +31,17 @@ parse_args() {
     command -v git >/dev/null  || die "git is required"
     command -v rsync >/dev/null || die "rsync is required"
     command -v ssh >/dev/null  || die "ssh is required"
+    command -v python3 >/dev/null || die "python3 is required (for TOML→JSON)"
+    # ponytail: config is TOML (comments-friendly) but the script queries with jq.
+    # Convert once at startup via python3's stdlib tomllib into a temp JSON file,
+    # then every jq call below reads that. Cheaper than replacing 27 jq calls with
+    # a jq-syntax `tomlq` (which would add a pipx dep). Upgrade path: swap to
+    # kislyuk/yq's `tomlq` and drop this conversion if the python3 dep becomes awkward.
+    local json; json="$(mktemp -t nightly-cfg.XXXXXX.json)"
+    python3 -c 'import sys,json,tomllib; json.dump(tomllib.load(open(sys.argv[1],"rb")),sys.stdout)' \
+        "$CONFIG" > "$json" || die "failed to parse TOML: $CONFIG"
+    CONFIG="$json"
+    trap 'rm -f "$CONFIG"' EXIT
 }
 
 # Required keys per target — fail fast with the offending target name.
@@ -93,8 +104,8 @@ push_one() {
     fi
     remote_root=$(jq -r '.remote.root' "$CONFIG")
     dest="$(remote_dest):$remote_root/$name/"
-    log "push $name → $dest ($(du -sh --exclude=.git "$ws" 2>/dev/null | cut -f1))"
-    rsync -az --delete --mkpath --exclude '.git/' --info=stats1,progress2 \
+    log "push $name → $dest ($(du -sh "$ws" 2>/dev/null | cut -f1))"
+    rsync -az --delete --mkpath --info=stats1,progress2 \
         -e "ssh ${SSH_OPTS[*]}" "$ws"/ "$dest"
 }
 
@@ -158,17 +169,29 @@ cmd_sync() {
     local n i rc=0
     n=$(jq '.targets | length' "$CONFIG")
     log "sync: $n targets, remote $(remote_dest):$(jq -r '.remote.root' "$CONFIG")"
-    log "phase 1/2: clone/update $n repos locally"
+    log "phase 1/2: clone/update $n repos locally (parallel)"
+    local pids=() idx=()
     for i in $(seq 0 $((n-1))); do
-        if ! clone_one "$i"; then
-            die "clone FAILED for target $(jq -r ".targets[$i].name" "$CONFIG")"
+        clone_one "$i" & pids+=($!); idx+=("$i")
+    done
+    for k in "${!pids[@]}"; do
+        if ! wait "${pids[$k]}"; then
+            die "clone FAILED for target $(jq -r ".targets[${idx[$k]}].name" "$CONFIG")"
         fi
     done
-    log "phase 2/2: push repo + $n targets to remote"
-    if ! sync_self; then log "push FAILED for yk-benchmarks-fork"; rc=1; fi
+    log "phase 2/2: push repo + $n targets to remote (parallel)"
+    pids=(); idx=()
+    sync_self & pids+=($!); idx+=("-1")
     for i in $(seq 0 $((n-1))); do
-        if ! push_one "$i"; then
-            log "push FAILED for target index $i"
+        push_one "$i" & pids+=($!); idx+=("$i")
+    done
+    for k in "${!pids[@]}"; do
+        if ! wait "${pids[$k]}"; then
+            if [ "${idx[$k]}" = "-1" ]; then
+                log "push FAILED for yk-benchmarks-fork"
+            else
+                log "push FAILED for target $(jq -r ".targets[${idx[$k]}].name" "$CONFIG")"
+            fi
             rc=1
         fi
     done
@@ -182,9 +205,13 @@ cmd_build() {
     log "build logs: $BUILD_DIR"
     local n rc=0
     n=$(jq '.targets | length' "$CONFIG")
+    local pids=() idx=()
     for i in $(seq 0 $((n-1))); do
-        if ! build_one "$i"; then
-            log "build FAILED for target $(jq -r ".targets[$i].name" "$CONFIG")"
+        build_one "$i" & pids+=($!); idx+=("$i")
+    done
+    for k in "${!pids[@]}"; do
+        if ! wait "${pids[$k]}"; then
+            log "build FAILED for target $(jq -r ".targets[${idx[$k]}].name" "$CONFIG")"
             rc=1
         fi
     done
@@ -213,6 +240,7 @@ main() {
         sync)  cmd_sync ;;
         build) cmd_build ;;
         bench) cmd_bench ;;
+        run)   cmd_build && cmd_bench ;;
         *) die "unknown subcommand: $CMD" ;;
     esac
 }

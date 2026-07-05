@@ -5,7 +5,7 @@ Everything lives here so upstream merges never conflict with this workflow.
 
 ## Prerequisites
 
-- Local: `bash`, `jq`, `git`, `rsync`, `ssh`
+- Local: `bash`, `jq`, `python3` (≥3.11 for stdlib `tomllib`), `git`, `rsync`, `ssh`
 - ssh key auth already working against the remote host
 - Remote: whatever each target's build needs, plus `haste` on `$PATH`
 
@@ -15,7 +15,7 @@ Everything lives here so upstream merges never conflict with this workflow.
     ./nightly.sh run    [--config path]   # ssh-execute build+run, capture logs
     ./run-nightly.sh                      # sync then run, exit combined status
 
-Default config path: `nightly/config.json`.
+Default config path: `nightly/config.toml`.
 
 ## Config schema
 
@@ -36,6 +36,6 @@ Never overwritten. Prune by mtime if disk fills up.
 
 ## Adding a target
 
-Append an object to `config.json`'s `targets` array. Sync + run picks it up on
+Append an object to `config.toml`'s `targets` array. Sync + run picks it up on
 the next invocation. Sequential, keep-going-on-failure: one bad target does
 not abort the rest; the final exit is non-zero if any failed.
