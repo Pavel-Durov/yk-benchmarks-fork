@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+
 """Config-driven runner for haste benchmarks on a remote bench host.
 
 Subcommands: sync | build | bench | run
@@ -13,6 +14,10 @@ import shlex
 import shutil
 import subprocess
 import sys
+
+if sys.version_info < (3, 11):
+    sys.exit(f"nightly requires Python >= 3.11 (got {sys.version.split()[0]})")
+
 import tomllib
 from pathlib import Path
 
@@ -72,7 +77,9 @@ def bench_cmd(remote_root: str, name: str, tmpl: str, env: dict) -> str:
         f"mkdir -p nightly/rendered &&\n"
         f"{exports}\n"
         f"envsubst < {shlex.quote(template)} > {shlex.quote(rendered)} &&\n"
-        f"haste bench -f {shlex.quote(rendered)} "
+        # stdbuf -oL -eL: line-buffer the remote pipes so `bench` output streams
+        # back as it happens, not in 4 KiB chunks.
+        f"stdbuf -oL -eL haste bench -f {shlex.quote(rendered)} "
         f"-c {shlex.quote(f'nightly_{name}')} --order declaration"
     )
 
@@ -88,9 +95,32 @@ def run(cmd: list[str], **kw) -> subprocess.CompletedProcess:
     return subprocess.run(cmd, **kw)
 
 
+def _remote_test_x(dest: str, path: str) -> int:
+    """`test -x path` on `dest` (ssh unless dest is this host). Returns 0 if OK."""
+    if _is_localhost(dest):
+        return subprocess.run(["test", "-x", path]).returncode
+    return subprocess.run(["ssh", *SSH_OPTS, dest, f"test -x {shlex.quote(path)}"],
+                          capture_output=True).returncode
+
+
+def _is_localhost(host: str) -> bool:
+    """True if `host` names the current machine — then we skip ssh."""
+    import socket
+    h = host.split("@", 1)[-1]  # strip user@
+    try:
+        me = {socket.gethostname(), socket.getfqdn(), "localhost", "127.0.0.1"}
+        return h in me or socket.gethostbyname(h) in {"127.0.0.1", "::1"}
+    except OSError:
+        return False
+
+
 def ssh_run(dest: str, remote_cmd: str, stdout: Path | None = None,
             stderr: Path | None = None, tee: bool = False) -> int:
-    args = ["ssh", *SSH_OPTS, dest, f"bash -lc {shlex.quote(remote_cmd)}"]
+    if _is_localhost(dest):
+        # Skip ssh loopback — run in a plain login-less bash on this host.
+        args = ["bash", "-c", remote_cmd]
+    else:
+        args = ["ssh", *SSH_OPTS, dest, f"bash -lc {shlex.quote(remote_cmd)}"]
     if stdout is None:
         return run(args).returncode
     if tee:
@@ -160,6 +190,7 @@ def sync_self(dest_host: str, remote_root: str) -> None:
         "--exclude", "nightly/workspace/",
         "--exclude", "nightly/results/",
         "--exclude", ".git/",
+        "--exclude", ".haste/",       # preserve haste's on-remote state
         "--info=stats1,progress2",
         "-e", "ssh " + " ".join(SSH_OPTS),
         f"{repo_root}/", dest,
@@ -172,8 +203,22 @@ def build_one(target: dict, dest_host: str, remote_root: str, build_dir: Path) -
     out.mkdir(parents=True, exist_ok=True)
     cmd = build_cmd(remote_root, name, target["build"])
     (out / "cmd").write_text(cmd + "\n")
-    log(f"build {name}")
-    return ssh_run(dest_host, cmd, out / "stdout.log", out / "stderr.log")
+    log(f"build [{name}] logs → {out}/{{stdout,stderr}}.log")
+    rc = ssh_run(dest_host, cmd, out / "stdout.log", out / "stderr.log")
+    log(f"build [{name}] exit={rc}")
+    if rc != 0:
+        return rc
+    # Verify the built binary actually lands where env.EXE says.
+    exe = (target.get("env") or {}).get("EXE")
+    if not exe:
+        log(f"build [{name}] check: skipped (no env.EXE)")
+        return 0
+    log(f"build [{name}] check: test -x {exe} on {dest_host}")
+    if _remote_test_x(dest_host, exe) == 0:
+        log(f"build [{name}] check: OK — {exe}")
+        return 0
+    log(f"build [{name}] check: FAIL — MISSING {exe}")
+    return 1
 
 
 def bench_one(target: dict, dest_host: str, remote_root: str, results_dir: Path) -> int:
@@ -182,8 +227,15 @@ def bench_one(target: dict, dest_host: str, remote_root: str, results_dir: Path)
     out.mkdir(parents=True, exist_ok=True)
     cmd = bench_cmd(remote_root, name, target["template"], target.get("env", {}))
     (out / "cmd").write_text(cmd + "\n")
-    log(f"bench {name}")
-    return ssh_run(dest_host, cmd, out / "stdout.log", out / "stderr.log", tee=True)
+    log(f"bench [{name}] template={target['template']}")
+    log(f"bench [{name}] logs → {out}/{{stdout,stderr}}.log")
+    log(f"bench [{name}] ssh {dest_host}: cd {remote_root}/yk-benchmarks-fork; "
+        f"envsubst templates/haste_{target['template']}.toml → rendered/haste_{name}.toml; "
+        f"haste bench -c nightly_{name}")
+    log(f"bench [{name}] full remote command written to {out}/cmd")
+    rc = ssh_run(dest_host, cmd, out / "stdout.log", out / "stderr.log", tee=True)
+    log(f"bench [{name}] exit={rc}")
+    return rc
 
 
 # --- subcommands -------------------------------------------------------------
@@ -285,10 +337,8 @@ def cmd_check(cfg: dict) -> int:
 
         exe = (t.get("env") or {}).get("EXE")
         if exe:
-            log(f"[{name}] build: ssh {dest_host} test -x {exe}")
-            r = subprocess.run(["ssh", *SSH_OPTS, dest_host,
-                                f"test -x {shlex.quote(exe)}"], capture_output=True)
-            exe_ok = r.returncode == 0
+            log(f"[{name}] build: test -x {exe} on {dest_host}")
+            exe_ok = _remote_test_x(dest_host, exe) == 0
             exe_msg = "OK" if exe_ok else f"MISSING {exe}"
         else:
             exe_ok = True
@@ -322,7 +372,7 @@ def cmd_bench(cfg: dict) -> int:
 # --- entrypoint --------------------------------------------------------------
 
 def main(argv: list[str] | None = None) -> int:
-    p = argparse.ArgumentParser(prog="nightly.py")
+    p = argparse.ArgumentParser(prog="nightly")
     p.add_argument("command", choices=["sync", "build", "bench", "run", "check"])
     p.add_argument("--config", default=str(HERE / "config.toml"))
     args = p.parse_args(argv)

@@ -41,7 +41,7 @@ def test_bench_cmd_includes_pieces():
     assert "cd /r/yk-benchmarks-fork" in c
     assert "export EXE=/x" in c
     assert "envsubst < nightly/templates/haste_som.toml" in c
-    assert "haste bench -f nightly/rendered/haste_t.toml -c nightly_t --order declaration" in c
+    assert "stdbuf -oL -eL haste bench -f nightly/rendered/haste_t.toml -c nightly_t --order declaration" in c
 
 
 def test_validate_ok():
