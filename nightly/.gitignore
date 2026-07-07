@@ -1,0 +1,5 @@
+workspace/
+results/
+rendered/
+__pycache__/
+*.pyc
